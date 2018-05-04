@@ -8,6 +8,7 @@ import collections
 from os import path
 import platform
 import _ctypes
+import six
 
 from .core import working_block
 from .wire import Input, Output, Const, WireVector, Register
@@ -15,6 +16,10 @@ from .memory import RomBlock
 from .pyrtlexceptions import PyrtlError, PyrtlInternalError
 from .simulation import SimulationTrace
 
+try:
+    import _pyrtlsimrunner
+except ImportError:
+    _pyrtlsimrunner = None
 
 __all__ = ['CompiledSimulation']
 
@@ -74,7 +79,7 @@ class CompiledSimulation(object):
 
     In order to use this, you need:
         - A 64-bit processor
-        - GCC (tested on version 4.8.4)
+        - GCC (tested on version 5.4.0)
         - A 64-bit build of Python
     If using the multiplication operand, only some architectures are supported:
         - x86-64 / amd64
@@ -83,6 +88,10 @@ class CompiledSimulation(object):
 
     default_value is currently only implemented for registers, not memories.
     """
+
+    _cmd_line = [
+        'gcc', '-O1', '-march=native', '-std=c99', '-m64', '-shared', '-fPIC', '-mcmodel=medium'
+    ]
 
     def __init__(
             self, tracer=True, register_value_map={}, memory_value_map={},
@@ -126,15 +135,56 @@ class CompiledSimulation(object):
 
         The argument is a mapping from input names to the values for the step.
         """
-        self.run([inputs])
+        self.run({k: [v] for k, v in inputs.items()})
 
     def run(self, inputs):
         """Run many steps of the simulation.
 
-        The argument is a list of input mappings for each step,
-        and its length is the number of steps to be executed.
+        The argument is a dictionary mapping inputs to a list of their values for each step.
         """
-        steps = len(inputs)
+        if not inputs:
+            steps = 1
+        else:
+            steps = len(inputs[next(iter(inputs))])
+            if not all(len(inputs[x]) == steps for x in inputs):
+                raise PyrtlError('Mismatched input list lengths')
+
+        if _pyrtlsimrunner is not None:
+            self._run_fast(inputs, steps)
+        else:
+            self._run_fallback(inputs, steps)
+
+    def _run_fast(self, inputs, steps):
+        inp = [(w.name if isinstance(w, WireVector) else w, inputs[w]) for w in inputs]
+
+        data_in = [(self._inputpos[name][0], self._inputbw[name], dat) for name, dat in inp]
+
+        data_out = []
+        for name in self.tracer.trace:
+            rname = self._probe_mapping.get(name, name)
+            if rname in self._outputpos:
+                start, count = self._outputpos[rname]
+                isout = True
+            elif rname in self._inputpos:
+                start, count = self._inputpos[rname]
+                isout = False
+            else:
+                raise PyrtlInternalError('Untraceable wire in tracer')
+            data_out.append((isout, start, count, self.tracer.trace[name]))
+
+        try:
+            _pyrtlsimrunner.sim_pyrun(  # pylint: disable=no-member
+                steps, self._ibufsz, self._obufsz,
+                data_in, data_out, self._dll._handle)
+        except RuntimeError as e:
+            if e.args:
+                six.raise_from(PyrtlError(
+                    'Wire {} has value which cannot be represented using its bitwidth'
+                    .format(inp[int(e.args[0])][0])), None)
+            else:
+                six.raise_from(PyrtlInternalError, None)
+
+    def _run_fallback(self, inputs, steps):
         # create i/o arrays of the appropriate length
         ibuf_type = ctypes.c_uint64*(steps*self._ibufsz)
         obuf_type = ctypes.c_uint64*(steps*self._obufsz)
@@ -144,16 +194,15 @@ class CompiledSimulation(object):
         self._crun.argtypes = [ctypes.c_uint64, ibuf_type, obuf_type]
 
         # build the input array
-        for n, inmap in enumerate(inputs):
-            for w in inmap:
-                if isinstance(w, WireVector):
-                    name = w.name
-                else:
-                    name = w
-                start, count = self._inputpos[name]
-                start += n*self._ibufsz
-                val = inmap[w]
-                if val >= 1 << self._inputbw[name]:
+        for w in inputs:
+            if isinstance(w, WireVector):
+                name = w.name
+            else:
+                name = w
+            start, count = self._inputpos[name]
+            maxsize = 1 << self._inputbw[name]
+            for n, val in enumerate(inputs[w]):
+                if val >= maxsize:
                     raise PyrtlError(
                         'Wire {} has value {} which cannot be represented '
                         'using its bitwidth'.format(name, val))
@@ -161,6 +210,7 @@ class CompiledSimulation(object):
                 for pos in range(start, start+count):
                     ibuf[pos] = val & ((1 << 64)-1)
                     val >>= 64
+                start += self._ibufsz
 
         # run the simulation
         self._crun(steps, ibuf, obuf)
@@ -216,11 +266,11 @@ class CompiledSimulation(object):
         self._dir = tempfile.mkdtemp()
         with open(path.join(self._dir, 'pyrtlsim.c'), 'w') as f:
             self._create_code(lambda s: f.write(s+'\n'))
-        subprocess.check_call([
-            'gcc', '-O0', '-march=native', '-std=c99', '-m64',
-            '-shared', '-fPIC', '-mcmodel=medium',
-            path.join(self._dir, 'pyrtlsim.c'), '-o', path.join(self._dir, 'pyrtlsim.so'),
-            ], shell=(platform.system() == 'Windows'))
+        subprocess.check_call(
+            self._cmd_line +
+            [path.join(self._dir, 'pyrtlsim.c'), '-o', path.join(self._dir, 'pyrtlsim.so')],
+            shell=(platform.system() == 'Windows')
+        )
         self._dll = ctypes.CDLL(path.join(self._dir, 'pyrtlsim.so'))
         self._crun = self._dll.sim_run_all
         self._crun.restype = None  # argtypes set on use
@@ -457,14 +507,33 @@ class CompiledSimulation(object):
                 dest=self.varname[dest], n=n, res='|'.join(res),
                 mask=self._makemask(dest, cattotal, n)))
 
+    def _build_select_piece(self, pieces, src, sfir, dfir, size):
+        l, b = divmod(sfir, 64)
+        pieces.append('((({src}[{l}]>>{b})&0x{mask:X})<<{db})'.format(
+            src=self.varname[src], l=l, b=b, db=dfir, mask=(1 << size)-1))
+
     def _build_select(self, write, op, param, args, dest):
-        for n in range(self._limbs(dest)):
-            bits = [
-                '((1&({src}[{limb}]>>{sb}))<<{db})'.format(
-                    src=self.varname[args[0]], sb=(b % 64), limb=(b//64), db=en)
-                for en, b in enumerate(param[64*n:min(dest.bitwidth, 64*(n+1))])]
-            write('{dest}[{n}] = {bits};'.format(
-                dest=self.varname[dest], n=n, bits='|'.join(bits)))
+        for limb in range(self._limbs(dest)):
+            size = None
+            sfir = None
+            dfir = None
+            pieces = []
+            for db, sb in enumerate(param[64*limb:min(dest.bitwidth, 64*(limb+1))]):
+                if size is None:
+                    sfir = sb
+                    dfir = db
+                    size = 1
+                elif sb == sfir+size and sb % 64:
+                    size += 1
+                else:
+                    self._build_select_piece(pieces, args[0], sfir, dfir, size)
+                    sfir = sb
+                    dfir = db
+                    size = 1
+            if size:
+                self._build_select_piece(pieces, args[0], sfir, dfir, size)
+            write('{dest}[{limb}] = {pieces};'.format(
+                dest=self.varname[dest], limb=limb, pieces='|'.join(pieces)))
 
     def _create_code(self, write):
         write('#include <stdint.h>')

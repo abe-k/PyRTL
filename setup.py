@@ -1,4 +1,4 @@
-from setuptools import setup, find_packages
+from setuptools import setup, find_packages, Extension
 
 setup(
     name = 'pyrtl',
@@ -14,6 +14,8 @@ setup(
     extras_require =  {
         'blif parsing': ['pyparsing']
         },
+    ext_modules = [Extension('_pyrtlsimrunner',
+        ['pyrtl/_pyrtlsimrunner.c'], optional=True)],
     classifiers = [
         'Development Status :: 4 - Beta',
         'Environment :: Console',

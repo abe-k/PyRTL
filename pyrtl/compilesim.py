@@ -8,7 +8,6 @@ import collections
 from os import path
 import platform
 import _ctypes
-import six
 
 from .core import working_block
 from .wire import Input, Output, Const, WireVector, Register
@@ -178,11 +177,15 @@ class CompiledSimulation(object):
                 data_in, data_out, self._dll._handle)
         except RuntimeError as e:
             if e.args:
-                six.raise_from(PyrtlError(
+                problem = PyrtlError(
                     'Wire {} has value which cannot be represented using its bitwidth'
-                    .format(inp[int(e.args[0])][0])), None)
+                    .format(inp[int(e.args[0])][0]))
             else:
-                six.raise_from(PyrtlInternalError, None)
+                problem = PyrtlInternalError('Problem encountered running CompiledSimulation step')
+        else:
+            problem = None
+        if problem:
+            raise problem
 
     def _run_fallback(self, inputs, steps):
         # create i/o arrays of the appropriate length
@@ -202,7 +205,7 @@ class CompiledSimulation(object):
             start, count = self._inputpos[name]
             maxsize = 1 << self._inputbw[name]
             for n, val in enumerate(inputs[w]):
-                if val >= maxsize:
+                if val >= maxsize or val < 0:
                     raise PyrtlError(
                         'Wire {} has value {} which cannot be represented '
                         'using its bitwidth'.format(name, val))
@@ -281,6 +284,8 @@ class CompiledSimulation(object):
 
     def _makeini(self, w, v):
         """C initializer string for a wire with a given value."""
+        if v < 0 or v >= (1 << w.bitwidth):
+            raise PyrtlError('Initial value {} out of range for {}'.format(v, w.name))
         pieces = []
         for n in range(self._limbs(w)):
             pieces.append(hex(v & ((1 << 64)-1)))
@@ -564,7 +569,7 @@ class CompiledSimulation(object):
         mems = {net.op_param[1] for net in self.block.logic_subset('m@')}
         for key in self._memmap:
             if key not in mems:
-                raise PyrtlError('unrecognized MemBlock in memory_value_map')
+                raise PyrtlError('Unrecognized MemBlock in memory_value_map')
             if isinstance(key, RomBlock):
                 raise PyrtlError('RomBlock in memory_value_map')
         for mem in mems:

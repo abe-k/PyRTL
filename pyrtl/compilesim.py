@@ -84,8 +84,6 @@ class CompiledSimulation(object):
         - x86-64 / amd64
         - arm64 / aarch64 (untested)
         - mips64 (untested)
-
-    default_value is currently only implemented for registers, not memories.
     """
 
     _cmd_line = [
@@ -344,17 +342,26 @@ class CompiledSimulation(object):
             write('};')
         else:
             write('EXPORT')
-            if mem in self._memmap:
-                highest = min(1 << mem.addrwidth, max(self._memmap[mem])+1)
-                memval = [self._memmap[mem].get(n, 0) for n in range(highest)]
+            if self.default_value or mem in self._memmap:
                 write('uint{width}_t {name}[{size}][{limbs}] = {{'.format(
                     name=vn, width=self._memwidth(mem),
                     size=1 << mem.addrwidth, limbs=self._limbs(mem)))
-                for mv in memval:
-                    write(self._makeini(mem, mv)+',')
+                if mem in self._memmap:
+                    if self.default_value:
+                        memval = [
+                            self._memmap[mem].get(n, self.default_value)
+                            for n in range(1 << mem.addrwidth)
+                        ]
+                    else:
+                        highest = min(1 << mem.addrwidth, max(self._memmap[mem])+1)
+                        memval = [self._memmap[mem].get(n, 0) for n in range(highest)]
+                    for mv in memval:
+                        write(self._makeini(mem, mv)+',')
+                else:
+                    write('[0 ... {top}] = {ini}'.format(
+                        top=(1 << mem.addrwidth)-1, ini=self._makeini(mem, self.default_value)))
                 write('};')
             else:
-                # initialize to zero by default
                 write('uint{width}_t {name}[{size}][{limbs}] = {{{{0}}}};'.format(
                     name=vn, width=self._memwidth(mem),
                     size=1 << mem.addrwidth, limbs=self._limbs(mem)))
